@@ -71,8 +71,7 @@ public enum JSONValue: Codable, Equatable, Sendable {
             if CFGetTypeID(value) == CFBooleanGetTypeID() {
                 self = .bool(value.boolValue)
             } else if value.doubleValue.truncatingRemainder(dividingBy: 1) == 0,
-                let intValue = Int(exactly: value)
-            {
+                let intValue = Int(exactly: value) {
                 self = .int(intValue)
             } else {
                 self = .double(value.doubleValue)

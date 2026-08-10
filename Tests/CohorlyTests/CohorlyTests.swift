@@ -11,6 +11,11 @@ private extension JSONValue {
         if case .int(let value) = self { return value }
         return nil
     }
+    var doubleValue: Double? {
+        if case .double(let value) = self { return value }
+        if case .int(let value) = self { return Double(value) }
+        return nil
+    }
 }
 
 /// Deterministic clock for driving automatic-event session math in tests.
@@ -56,10 +61,12 @@ final class CohorlyTests: XCTestCase {
         client.track("Button Clicked", properties: ["button": "signup"])
         await client.flush()
 
-        XCTAssertEqual(transport.requests.count, 1)
-        XCTAssertEqual(transport.requests[0].path, "/track")
+        // identify() also fires a best-effort /alias post (see the "identify()
+        // aliasing" tests below); isolate the /track call this test cares about.
+        let trackRequests = transport.requests.filter { $0.path == "/track" }
+        XCTAssertEqual(trackRequests.count, 1)
 
-        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: trackRequests[0].body)
         XCTAssertEqual(events.count, 1)
         let event = events[0]
         XCTAssertEqual(event.event, "Button Clicked")
@@ -196,6 +203,112 @@ final class CohorlyTests: XCTestCase {
         XCTAssertNotEqual(client.currentDistinctId, "user-1")
     }
 
+    // MARK: - identify() aliasing
+
+    func testIdentifyWhileAnonymousPostsAliasOnce() {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            token: "proj_abc123",
+            transport: transport,
+            storage: InMemoryStorage()
+        )
+        let anonId = client.currentDistinctId
+        client.identify("user-42")
+        waitUntil { client.currentDistinctId == "user-42" }
+
+        waitUntil { transport.requests.count == 1 }
+        XCTAssertEqual(transport.requests[0].path, "/alias")
+        let payload = try! JSONDecoder().decode(AliasPayload.self, from: transport.requests[0].body)
+        XCTAssertEqual(payload.alias, anonId)
+        XCTAssertEqual(payload.distinctId, "user-42")
+        XCTAssertEqual(payload.token, "proj_abc123")
+
+        // Still just the one request - no double-posting.
+        waitUntil(timeout: 0.3) { transport.requests.count == 1 }
+        XCTAssertEqual(transport.requests.count, 1)
+    }
+
+    func testIdentifyWhenAlreadyIdentifiedPostsNothing() {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage()
+        )
+        client.identify("user-1")
+        waitUntil { client.currentDistinctId == "user-1" }
+        waitUntil { transport.requests.count == 1 }
+
+        client.identify("user-2")
+        waitUntil { client.currentDistinctId == "user-2" }
+
+        waitUntil(timeout: 0.3) { transport.requests.count == 1 }
+        XCTAssertEqual(transport.requests.count, 1)
+    }
+
+    func testIdentifyWithSameIdPostsNothing() {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage()
+        )
+        let anonId = client.currentDistinctId
+        client.identify(anonId)
+        waitUntil(timeout: 0.3) { true }
+
+        XCTAssertEqual(transport.requests.count, 0)
+        // Still anonymous: a same-id identify() is a true no-op, not a
+        // backdoor way to flip the anonymous flag on the current id.
+        XCTAssertEqual(client.currentDistinctId, anonId)
+    }
+
+    func testResetThenIdentifyAliasesNewAnonymousId() {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage()
+        )
+        let oldAnonId = client.currentDistinctId
+        client.identify("user-1")
+        waitUntil { client.currentDistinctId == "user-1" }
+        waitUntil { transport.requests.count == 1 }
+
+        client.reset()
+        waitUntil { client.currentDistinctId != "user-1" }
+        let newAnonId = client.currentDistinctId
+        XCTAssertNotEqual(newAnonId, oldAnonId)
+
+        client.identify("user-2")
+        waitUntil { client.currentDistinctId == "user-2" }
+        waitUntil { transport.requests.count == 2 }
+
+        let payload = try! JSONDecoder().decode(AliasPayload.self, from: transport.requests[1].body)
+        XCTAssertEqual(payload.alias, newAnonId)
+        XCTAssertEqual(payload.distinctId, "user-2")
+    }
+
+    func testAliasFailureDoesNotBlockIdentitySwitch() {
+        let transport = MockTransport(failuresRemaining: 1, failureStatus: 500)
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage()
+        )
+        client.identify("user-99")
+
+        // The identity switch takes effect regardless of the /alias outcome.
+        waitUntil { client.currentDistinctId == "user-99" }
+        waitUntil { transport.requests.count == 1 }
+        XCTAssertEqual(transport.requests[0].path, "/alias")
+
+        // Never retried: still just the one attempt after settling.
+        waitUntil(timeout: 0.3) { transport.requests.count == 1 }
+        XCTAssertEqual(transport.requests.count, 1)
+    }
+
     // MARK: - Token
 
     func testTokenIsStampedOnTrackedEventProperties() async {
@@ -230,7 +343,8 @@ final class CohorlyTests: XCTestCase {
         client.people.set(["plan": "pro"])
         await client.flush()
 
-        let payloads = try! JSONDecoder().decode([EngagePayload].self, from: transport.requests[0].body)
+        // identify() also fires a best-effort /alias post; isolate /engage.
+        let payloads = engagePayloads(transport)
         XCTAssertEqual(payloads[0].token, "proj_abc123")
     }
 
@@ -266,9 +380,10 @@ final class CohorlyTests: XCTestCase {
         client.people.set(["plan": "pro"])
         await client.flush()
 
-        XCTAssertEqual(transport.requests.count, 1)
-        XCTAssertEqual(transport.requests[0].path, "/engage")
-        let payloads = try! JSONDecoder().decode([EngagePayload].self, from: transport.requests[0].body)
+        // identify() also fires a best-effort /alias post; isolate /engage.
+        let engageRequests = transport.requests.filter { $0.path == "/engage" }
+        XCTAssertEqual(engageRequests.count, 1)
+        let payloads = try! JSONDecoder().decode([EngagePayload].self, from: engageRequests[0].body)
         XCTAssertEqual(payloads[0].distinctId, "user-9")
         XCTAssertEqual(payloads[0].set?["plan"]?.stringValue, "pro")
     }
@@ -284,6 +399,13 @@ final class CohorlyTests: XCTestCase {
             let data = raw.data(using: .utf8)
         else { return [] }
         return decodedEvents(data)
+    }
+
+    private func persistedEngageQueue(_ storage: CohorlyStorage) -> [EngagePayload] {
+        guard let raw = storage.string(forKey: "cohorly.engage_queue"),
+            let data = raw.data(using: .utf8)
+        else { return [] }
+        return (try? JSONDecoder().decode([EngagePayload].self, from: data)) ?? []
     }
 
     func testKeepsQueueIntactOn429() async {
@@ -369,6 +491,67 @@ final class CohorlyTests: XCTestCase {
         XCTAssertEqual(transport.requests.count, 2)
     }
 
+    // MARK: - reset() vs an in-flight flush
+
+    /// Keeps a request in flight for `delay` seconds and then fails, so a test
+    /// can call `reset()` while a flush is genuinely pending.
+    private final class DelayedFailingTransport: CohorlyTransport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var _requestCount = 0
+        private let delay: TimeInterval
+
+        init(delay: TimeInterval) { self.delay = delay }
+
+        var requestCount: Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return _requestCount
+        }
+
+        func post(apiHost: String, path: String, body: Data) async throws {
+            lock.lock()
+            _requestCount += 1
+            lock.unlock()
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            throw CohorlyTransportError.httpError(status: 500, retryAfter: nil)
+        }
+    }
+
+    func testResetDropsInFlightBatchInsteadOfRequeueing() async {
+        let transport = DelayedFailingTransport(delay: 0.3)
+        let storage = InMemoryStorage()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: storage,
+            flushInterval: 3600,
+            flushAt: 100  // no size trigger: the manual flush below is the only one
+        )
+        client.identify("user-a")
+        client.track("private-a")
+        client.people.set(["email": "a@example.com"])
+
+        let flush = Task { await client.flush() }
+        let deadline = Date().addingTimeInterval(2)
+        while transport.requestCount == 0 && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThan(transport.requestCount, 0, "flush never started")
+
+        client.reset()  // log out while the request is still in flight
+        await flush.value
+
+        // The requests failed (500), but their batches belong to the identity
+        // the app asked to forget: they must not come back into the queue or
+        // onto disk.
+        XCTAssertTrue(persistedQueue(storage).isEmpty)
+        XCTAssertTrue(persistedEngageQueue(storage).isEmpty)
+
+        let sentBefore = transport.requestCount
+        await client.flush()
+        XCTAssertEqual(transport.requestCount, sentBefore, "forgotten batch was re-sent")
+    }
+
     func testCapsQueueDroppingOldest() {
         let storage = InMemoryStorage()
         let client = Cohorly(
@@ -402,7 +585,7 @@ final class CohorlyTests: XCTestCase {
         let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
         let props = events[0].properties
         XCTAssertEqual(props["$manufacturer"]?.stringValue, "Apple")
-        XCTAssertEqual(props["$lib_version"]?.stringValue, "0.1.0")
+        XCTAssertEqual(props["$lib_version"]?.stringValue, "0.9.0")
         XCTAssertEqual(props["$lib"]?.stringValue, "ios")
         XCTAssertNotNil(props["$os"]?.stringValue)
         XCTAssertNotNil(props["$model"]?.stringValue)
@@ -508,9 +691,13 @@ final class CohorlyTests: XCTestCase {
         let sessions = trackEvents(transport).filter { $0.event == "$ae_session" }
         XCTAssertEqual(sessions.count, 1)
         XCTAssertEqual(sessions.first?.properties["$ae_session_length"]?.intValue, 15)
-        // Total sessions incremented via engage $add.
-        XCTAssertTrue(
-            engagePayloads(transport).contains { $0.add?["$ae_total_app_sessions"]?.intValue == 1 })
+        // Both counters land in a single engage $add op: session count and the
+        // cumulative session-length total.
+        let addOps = engagePayloads(transport).compactMap { $0.add }
+        XCTAssertTrue(addOps.contains {
+            $0["$ae_total_app_sessions"]?.intValue == 1
+                && $0["$ae_total_app_session_length"]?.intValue == 15
+        })
     }
 
     func testShortSessionNotTracked() async {
@@ -531,5 +718,298 @@ final class CohorlyTests: XCTestCase {
         await client.flush()
 
         XCTAssertTrue(trackEvents(transport).allSatisfy { $0.event != "$ae_session" })
+    }
+
+    // MARK: - Timed events
+
+    func testTimeEventAttachesDurationOnNextTrack() async {
+        let transport = MockTransport()
+        let clock = MutableClock()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1,
+            clock: clock
+        )
+        client.timeEvent("Level Completed")
+        clock.advance(by: 7.5)
+        client.track("Level Completed")
+        await client.flush()
+
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        XCTAssertEqual(events[0].properties["$duration"]?.doubleValue, 7.5)
+    }
+
+    func testDurationRoundsToThreeDecimals() async {
+        let transport = MockTransport()
+        let clock = MutableClock()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1,
+            clock: clock
+        )
+        client.timeEvent("X")
+        clock.advance(by: 1.23456)
+        client.track("X")
+        await client.flush()
+
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        XCTAssertEqual(events[0].properties["$duration"]?.doubleValue, 1.235)
+    }
+
+    func testDurationOmittedWithoutTimeEvent() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        client.track("plain")
+        await client.flush()
+
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        XCTAssertNil(events[0].properties["$duration"])
+    }
+
+    func testTimedEventClearedAfterTrackAndByClear() async {
+        let transport = MockTransport()
+        let clock = MutableClock()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 2,
+            clock: clock
+        )
+        // Timer clears on first track: a second track of the same event has no duration.
+        client.timeEvent("Once")
+        clock.advance(by: 3)
+        client.track("Once")
+        client.track("Once")
+        await client.flush()
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        XCTAssertEqual(events[0].properties["$duration"]?.doubleValue, 3)
+        XCTAssertNil(events[1].properties["$duration"])
+
+        // clearTimedEvent cancels a pending timer.
+        client.timeEvent("Cancelled")
+        client.clearTimedEvent("Cancelled")
+        clock.advance(by: 5)
+        client.timeEvent("Kept")
+        clock.advance(by: 5)
+        client.track("Cancelled")
+        client.track("Kept")
+        await client.flush()
+        let more = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[1].body)
+        XCTAssertNil(more.first { $0.event == "Cancelled" }?.properties["$duration"])
+        XCTAssertEqual(more.first { $0.event == "Kept" }?.properties["$duration"]?.doubleValue, 5)
+    }
+
+    // MARK: - Default profile properties
+
+    func testPeopleSetMergesDefaultProfilePropsWithUserKeysWinning() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        client.identify("user-9")
+        waitUntil { client.currentDistinctId == "user-9" }
+        // Supply a value that collides with a default key: the user value must win.
+        client.people.set(["plan": "pro", "$ios_lib_version": "override"])
+        await client.flush()
+
+        // identify() also fires a best-effort /alias post; isolate /engage.
+        let payloads = engagePayloads(transport)
+        let set = payloads[0].set
+        XCTAssertEqual(set?["plan"]?.stringValue, "pro")
+        // Default parity props are merged in.
+        XCTAssertEqual(set?["$swift_lib_version"]?.stringValue, "0.9.0")
+        XCTAssertNotNil(set?["$ios_device_model"]?.stringValue)
+        // User key overrides the default.
+        XCTAssertEqual(set?["$ios_lib_version"]?.stringValue, "override")
+    }
+
+    // MARK: - Device id / user id stamping
+
+    func testDeviceIdStampedAndEqualsAnonDistinctIdOnFreshInstall() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        let device = client.currentDeviceId
+        // Fresh install: device id equals the anonymous distinct id.
+        XCTAssertEqual(device, client.currentDistinctId)
+
+        client.track("x")
+        await client.flush()
+
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        XCTAssertEqual(events[0].properties["$device_id"]?.stringValue, device)
+    }
+
+    func testUserIdOmittedWhileAnonymous() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        client.track("x")
+        await client.flush()
+
+        let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
+        XCTAssertNil(events[0].properties["$user_id"])
+        XCTAssertNotNil(events[0].properties["$device_id"])
+    }
+
+    func testDeviceIdSurvivesIdentifyAndUserIdStampedOnceIdentified() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        let deviceBefore = client.currentDeviceId
+        client.identify("user-77")
+        waitUntil { client.currentDistinctId == "user-77" }
+        // Device id is unchanged by identify().
+        XCTAssertEqual(client.currentDeviceId, deviceBefore)
+
+        client.track("x")
+        await client.flush()
+
+        // identify() also fires a best-effort /alias post; isolate /track.
+        let events = trackEvents(transport)
+        XCTAssertEqual(events[0].properties["$device_id"]?.stringValue, deviceBefore)
+        XCTAssertEqual(events[0].properties["$user_id"]?.stringValue, "user-77")
+    }
+
+    func testCallerSuppliedDeviceIdAndUserIdWin() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        client.identify("user-1")
+        waitUntil { client.currentDistinctId == "user-1" }
+        client.track("x", properties: ["$device_id": "custom-device", "$user_id": "custom-user"])
+        await client.flush()
+
+        // identify() also fires a best-effort /alias post; isolate /track.
+        let events = trackEvents(transport)
+        XCTAssertEqual(events[0].properties["$device_id"]?.stringValue, "custom-device")
+        XCTAssertEqual(events[0].properties["$user_id"]?.stringValue, "custom-user")
+    }
+
+    func testResetMintsNewDeviceIdClearsTimersAndReanonymizes() async {
+        let transport = MockTransport()
+        let clock = MutableClock()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1,
+            clock: clock
+        )
+        client.identify("user-1")
+        waitUntil { client.currentDistinctId == "user-1" }
+        let deviceBefore = client.currentDeviceId
+
+        // Start a timer that reset() must cancel.
+        client.timeEvent("Pending")
+        client.reset()
+        waitUntil { client.currentDeviceId != deviceBefore }
+
+        // Fresh anon device id equals the new anon distinct id.
+        XCTAssertEqual(client.currentDeviceId, client.currentDistinctId)
+
+        // Timer was cleared: no $duration attached and back to anonymous ($user_id absent).
+        clock.advance(by: 9)
+        client.track("Pending")
+        await client.flush()
+
+        // identify() also fires a best-effort /alias post; isolate /track.
+        let events = trackEvents(transport)
+        XCTAssertNil(events[0].properties["$duration"])
+        XCTAssertNil(events[0].properties["$user_id"])
+        XCTAssertEqual(events[0].properties["$device_id"]?.stringValue, client.currentDeviceId)
+    }
+
+    func testMigratingInstallWithoutAnonymousFlagIsTreatedAsAnonymous() {
+        // Pre-seed a stored distinct id with no anonymous flag (install predating
+        // the flag) -> treated as anonymous: device id reuses the distinct id and
+        // no false $user_id is stamped. Identified users self-heal on identify().
+        let storage = InMemoryStorage()
+        storage.setString("legacy-user", forKey: "cohorly.distinct_id")
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: MockTransport(),
+            storage: storage
+        )
+        XCTAssertEqual(client.currentDistinctId, "legacy-user")
+        XCTAssertEqual(client.currentDeviceId, "legacy-user")
+        // Device id is persisted for stability across relaunches.
+        XCTAssertEqual(storage.string(forKey: "cohorly.device_id"), client.currentDeviceId)
+    }
+
+    func testMigratingIdentifiedInstallMintsFreshDeviceId() {
+        // Pre-seed a stored distinct id with the anonymous flag persisted as "0"
+        // (identified) -> a fresh device id (not the distinct id) is minted.
+        let storage = InMemoryStorage()
+        storage.setString("legacy-user", forKey: "cohorly.distinct_id")
+        storage.setString("0", forKey: "cohorly.anonymous")
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: MockTransport(),
+            storage: storage
+        )
+        XCTAssertEqual(client.currentDistinctId, "legacy-user")
+        XCTAssertNotEqual(client.currentDeviceId, "legacy-user")
+        XCTAssertEqual(storage.string(forKey: "cohorly.device_id"), client.currentDeviceId)
+    }
+
+    func testPeopleSetOnceMergesDefaultProfileProps() async {
+        let transport = MockTransport()
+        let client = Cohorly(
+            apiHost: "http://localhost:4000",
+            transport: transport,
+            storage: InMemoryStorage(),
+            flushInterval: 3600,
+            flushAt: 1
+        )
+        client.identify("user-7")
+        waitUntil { client.currentDistinctId == "user-7" }
+        client.people.setOnce(["signup_source": "web"])
+        await client.flush()
+
+        // identify() also fires a best-effort /alias post; isolate /engage.
+        let payloads = engagePayloads(transport)
+        let setOnce = payloads[0].setOnce
+        XCTAssertEqual(setOnce?["signup_source"]?.stringValue, "web")
+        XCTAssertEqual(setOnce?["$ios_lib_version"]?.stringValue, "0.9.0")
     }
 }

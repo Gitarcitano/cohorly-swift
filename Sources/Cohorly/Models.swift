@@ -52,3 +52,23 @@ public struct EngagePayload: Codable, Equatable, Sendable {
         case token
     }
 }
+
+/// Body for `/alias`, matching the Cohorly ingestion contract: links a
+/// previous (anonymous) id to the id it becomes. Built by `identify()`.
+struct AliasPayload: Codable, Equatable, Sendable {
+    var alias: String
+    var distinctId: String
+    var token: String?
+
+    enum CodingKeys: String, CodingKey {
+        case alias
+        case distinctId = "distinct_id"
+        case token
+    }
+
+    init(alias: String, distinctId: String, token: String? = nil) {
+        self.alias = alias
+        self.distinctId = distinctId
+        self.token = token
+    }
+}

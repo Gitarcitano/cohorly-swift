@@ -3,6 +3,8 @@
 Standalone Swift Package for Cohorly (hosted, Mixpanel-style product analytics). Supports
 iOS 15+ and macOS 12+ (macOS so `swift test` runs locally/in CI without a simulator).
 
+**Documentation:** [iOS SDK reference](https://cohorly-docs.velloalabs.com/sdks/ios) · [Quickstart](https://cohorly-docs.velloalabs.com/quickstart) · [HTTP API](https://cohorly-docs.velloalabs.com/api/ingestion)
+
 ## Install
 
 The whole cohorly monorepo is directly addable as a Swift Package - a root-level
@@ -82,9 +84,27 @@ let client = Cohorly(
 - `register(_ properties: [String: Any])` / `unregister(_ key: String)` - super properties
   merged into every event.
 - `people.set(_:)` / `people.setOnce(_:)` / `people.increment(_:)` / `people.unset(_:)` /
-  `people.deleteUser()`
+  `people.deleteUser()`. Note: `unset`/`deleteUser` are destructive and refused by the
+  server on the public project token alone (they need an org-owner or superadmin
+  `Authorization` credential this SDK does not send) - server-side no-ops here; remove
+  profile data from the dashboard or the admin privacy API instead.
 - `flush() async` - manually flush; also resolves once any auto-triggered flush completes.
 - `currentDistinctId: String`
+
+### Feature flags
+
+Flags are evaluated on `initialize` (opt out with `loadFeatureFlags: false`), on
+`identify()` and on `reset()`, and cached in storage scoped by distinct id; reads
+never hit the network. A failed evaluation keeps the previous cache.
+
+- `isFeatureEnabled(_ key: String) -> Bool` - false for unknown/unloaded flags.
+- `getFeatureFlag(_ key: String) -> JSONValue` - `.string(variant)` when the flag
+  serves a variant, else `.bool(enabled)`.
+- `getFeatureFlagPayload(_ key: String) -> JSONValue?`
+- `currentFeatureFlags() -> [String: FlagResult]`
+- `reloadFeatureFlags() async` - re-evaluate for the current distinct id.
+- `onFeatureFlags(_ callback:) -> () -> Void` - fires after every successful
+  reload (and immediately when flags are already loaded); returns unsubscribe.
 
 Auto-captured properties on every event: `$lib` ("ios"), `$os`, `$os_version`, `$model`,
 `$screen_width` / `$screen_height` (the last three via `UIKit` where available, e.g. skipped

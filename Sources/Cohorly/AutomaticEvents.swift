@@ -95,7 +95,12 @@ final class AutomaticEvents: @unchecked Sendable {
 
         let target = strongClient ?? client
         target?.track("$ae_session", properties: ["$ae_session_length": Int(length)])
-        target?.people.increment(["$ae_total_app_sessions": 1])
+        // Single engage op carrying both increments: session count and the
+        // cumulative session-length total (Mixpanel `$ae_total_app_session_length`).
+        target?.people.increment([
+            "$ae_total_app_sessions": 1,
+            "$ae_total_app_session_length": Int(length)
+        ])
     }
 
     /// Called from `Cohorly.deinit`; closes the final session on platforms

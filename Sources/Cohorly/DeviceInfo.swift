@@ -4,19 +4,27 @@ import Foundation
 import UIKit
 #endif
 
+#if canImport(Network)
+import Network
+#endif
+
+#if os(watchOS)
+import WatchKit
+#endif
+
 /// Auto-captured device/environment properties, merged into every event.
 enum DeviceInfo {
     static var libName: String { "ios" }
 
     /// SDK package version, sent as `$lib_version` on every event.
-    static let libVersion = "0.1.0"
+    static let libVersion = "0.9.0"
 
     static func autoProperties() -> Properties {
         var props: Properties = [
             "$lib": .string(libName),
             "$lib_version": .string(libVersion),
             "$os": .string(osName),
-            "$manufacturer": .string("Apple"),
+            "$manufacturer": .string("Apple")
         ]
 
         if let osVersion {
@@ -36,6 +44,46 @@ enum DeviceInfo {
         }
         if let height = screenHeight {
             props["$screen_height"] = .double(height)
+        }
+
+        // `$wifi`: reflects whether the current network path runs over Wi-Fi.
+        // Omitted until the path monitor reports its first update.
+        #if canImport(Network)
+        if let isWifi = NetworkReachability.shared.isWifi {
+            props["$wifi"] = .bool(isWifi)
+        }
+        #endif
+
+        // `$carrier`/`$radio`: intentionally omitted. Mixpanel legacy parity
+        // would source these from CTTelephonyNetworkInfo/CTCarrier, deprecated
+        // since iOS 16 (CTCarrier now returns the placeholder "--"), so there is
+        // no reliable value to report.
+
+        #if os(watchOS)
+        props["$watch_model"] = .string(WKInterfaceDevice.current().model)
+        #endif
+
+        return props
+    }
+
+    /// Default profile properties merged into every `people.set`/`setOnce`
+    /// (Mixpanel iOS parity). Caller-supplied keys always win over these.
+    static func defaultPeopleProperties() -> Properties {
+        var props: Properties = [
+            "$ios_lib_version": .string(libVersion),
+            "$swift_lib_version": .string(libVersion)
+        ]
+        if let osVersion {
+            props["$ios_version"] = .string(osVersion)
+        }
+        if let appVersion {
+            props["$ios_app_release"] = .string(appVersion)
+        }
+        if let appBuild {
+            props["$ios_app_version"] = .string(appBuild)
+        }
+        if let model {
+            props["$ios_device_model"] = .string(model)
         }
         return props
     }
@@ -58,8 +106,8 @@ enum DeviceInfo {
         #if canImport(UIKit) && !os(watchOS)
         return UIDevice.current.systemVersion
         #else
-        let v = ProcessInfo.processInfo.operatingSystemVersion
-        return "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        return "\(version.majorVersion).\(version.minorVersion).\(version.patchVersion)"
         #endif
     }
 
@@ -101,3 +149,35 @@ enum DeviceInfo {
         #endif
     }
 }
+
+#if canImport(Network)
+/// Process-wide Wi-Fi reachability tracker backing the `$wifi` event property.
+/// A single `NWPathMonitor` runs for the app lifetime and caches whether the
+/// current path uses the Wi-Fi interface. `isWifi` stays `nil` until the first
+/// path update, so `$wifi` is simply omitted before the monitor has reported.
+@available(iOS 12, macOS 10.14, tvOS 12, watchOS 6, *)
+final class NetworkReachability: @unchecked Sendable {
+    static let shared = NetworkReachability()
+
+    private let monitor = NWPathMonitor()
+    private let lock = NSLock()
+    private var cachedIsWifi: Bool?
+
+    var isWifi: Bool? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cachedIsWifi
+    }
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let usesWifi = path.usesInterfaceType(.wifi)
+            self.lock.lock()
+            self.cachedIsWifi = usesWifi
+            self.lock.unlock()
+        }
+        monitor.start(queue: DispatchQueue(label: "com.cohorly.network-monitor"))
+    }
+}
+#endif
