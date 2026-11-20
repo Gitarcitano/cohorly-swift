@@ -17,7 +17,7 @@ enum DeviceInfo {
     static var libName: String { "ios" }
 
     /// SDK package version, sent as `$lib_version` on every event.
-    static let libVersion = "0.9.0"
+    static let libVersion = "0.10.0"
 
     static func autoProperties() -> Properties {
         var props: Properties = [

@@ -585,7 +585,7 @@ final class CohorlyTests: XCTestCase {
         let events = try! JSONDecoder().decode([TrackEvent].self, from: transport.requests[0].body)
         let props = events[0].properties
         XCTAssertEqual(props["$manufacturer"]?.stringValue, "Apple")
-        XCTAssertEqual(props["$lib_version"]?.stringValue, "0.9.0")
+        XCTAssertEqual(props["$lib_version"]?.stringValue, "0.10.0")
         XCTAssertEqual(props["$lib"]?.stringValue, "ios")
         XCTAssertNotNil(props["$os"]?.stringValue)
         XCTAssertNotNil(props["$model"]?.stringValue)
@@ -835,7 +835,7 @@ final class CohorlyTests: XCTestCase {
         let set = payloads[0].set
         XCTAssertEqual(set?["plan"]?.stringValue, "pro")
         // Default parity props are merged in.
-        XCTAssertEqual(set?["$swift_lib_version"]?.stringValue, "0.9.0")
+        XCTAssertEqual(set?["$swift_lib_version"]?.stringValue, "0.10.0")
         XCTAssertNotNil(set?["$ios_device_model"]?.stringValue)
         // User key overrides the default.
         XCTAssertEqual(set?["$ios_lib_version"]?.stringValue, "override")
@@ -1010,6 +1010,6 @@ final class CohorlyTests: XCTestCase {
         let payloads = engagePayloads(transport)
         let setOnce = payloads[0].setOnce
         XCTAssertEqual(setOnce?["signup_source"]?.stringValue, "web")
-        XCTAssertEqual(setOnce?["$ios_lib_version"]?.stringValue, "0.9.0")
+        XCTAssertEqual(setOnce?["$ios_lib_version"]?.stringValue, "0.10.0")
     }
 }

@@ -46,6 +46,90 @@ struct FailableFlag: Decodable, Sendable {
     }
 }
 
+/// How flag assignments are sourced and persisted (Mixpanel's
+/// `variantLookupPolicy` equivalent, "Flag Persistence" in the feature-flags
+/// docs). The three modes and their names are shared verbatim across all
+/// Cohorly client SDKs (sdk-core, sdk-web, sdk-react-native, Android).
+public enum FlagPersistenceMode: String, Sendable {
+    /// Never reads nor writes the persisted cache: flags only ever come from
+    /// a `/flags/evaluate` response received this session. A failed
+    /// evaluation leaves nothing to serve, so reads resolve to the fallback.
+    case networkOnly
+    /// Prefers the network; a valid persisted cache (inside the TTL, same
+    /// distinct id) is served whenever an evaluation fails or none has
+    /// succeeded yet, and the cache is still written on every success.
+    /// Strict about freshness: a cache past the TTL is dropped, never
+    /// served (unlike `persistenceUntilNetworkSuccess`, which tolerates
+    /// staleness). Because this API's getters are synchronous - they cannot
+    /// await a response the way Mixpanel's async lookups do - a valid cache
+    /// is adopted immediately, like `persistenceUntilNetworkSuccess`.
+    case networkFirst
+    /// Serves the persisted cache immediately so startup doesn't flicker;
+    /// the first successful evaluation takes over and re-persists. A failed
+    /// evaluation keeps the cached values serving. This is the default: it
+    /// preserves the pre-policy behavior of always restoring the cache.
+    /// Trades freshness for offline availability: a cache past the TTL still
+    /// serves while inside `Cohorly.flagCacheMaxStale` (7 days), and a
+    /// legacy cache without `stored_at` serves indefinitely.
+    case persistenceUntilNetworkSuccess
+}
+
+/// Where a served flag value came from. The raw values are the wire strings
+/// shared with the other SDKs (reported as `$feature_flag_source` on
+/// `$feature_flag_called`).
+public enum FlagSource: String, Sendable {
+    /// From a `/flags/evaluate` response received this session.
+    case network
+    /// From the persisted cache (same distinct id, usable under the active
+    /// `FlagPersistenceMode`).
+    case persistence
+    /// The flag is unknown or unloaded, so the caller's fallback was served.
+    case fallback
+}
+
+/// The full result of a flag lookup: the value plus its provenance, so a
+/// caller can tell a fresh assignment apart from a persisted or fallback one.
+public struct FlagDetails: Equatable, Sendable {
+    /// The flag key this result describes.
+    public var key: String
+    /// The flag's variant when it has one, else its enabled boolean; the
+    /// caller's fallback when the flag is unknown or unloaded.
+    public var value: JSONValue
+    /// The flag's enabled boolean. When the flag is unknown this is the
+    /// truthiness of the fallback (`.bool(true)` or a non-empty `.string`),
+    /// matching what `isFeatureEnabled(key, fallback:)` would return.
+    public var enabled: Bool
+    /// The JSON payload attached to the flag, or `nil` when it has none or
+    /// the flag is unknown.
+    public var payload: JSONValue?
+    public var source: FlagSource
+    /// Epoch ms when the served flag set was written to the cache; non-nil
+    /// only when `source == .persistence` AND the cache carries `stored_at`
+    /// (a legacy cache has no provable age, so this stays `nil`).
+    public var persistedAt: Int?
+    /// The configured cache TTL in ms; non-nil only when
+    /// `source == .persistence`.
+    public var ttlMs: Int?
+
+    public init(
+        key: String,
+        value: JSONValue,
+        enabled: Bool,
+        payload: JSONValue? = nil,
+        source: FlagSource,
+        persistedAt: Int? = nil,
+        ttlMs: Int? = nil
+    ) {
+        self.key = key
+        self.value = value
+        self.enabled = enabled
+        self.payload = payload
+        self.source = source
+        self.persistedAt = persistedAt
+        self.ttlMs = ttlMs
+    }
+}
+
 /// Fetcher used for feature-flag evaluation: POSTs `body` to
 /// `apiHost + path` and returns the raw response data.
 ///
@@ -120,13 +204,25 @@ struct FlagsResponse: Codable, Equatable, Sendable {
 
 /// Persisted flag cache. `distinctId` scopes the cache: on load it is
 /// discarded when it does not match the current distinct id, so one user's
-/// flags are never served to another.
+/// flags are never served to another. `storedAt` (epoch ms) bounds its age
+/// per the active `FlagPersistenceMode`. Caches written by pre-TTL SDK
+/// versions carry no `storedAt`; their age cannot be proven, so they are
+/// served rather than expired - the graceful-upgrade path preserving the
+/// pre-feature behavior (the cache was served indefinitely).
 struct FlagsCache: Codable, Equatable, Sendable {
     var distinctId: String
     var flags: [String: FlagResult]
+    var storedAt: Int?
+
+    init(distinctId: String, flags: [String: FlagResult], storedAt: Int? = nil) {
+        self.distinctId = distinctId
+        self.flags = flags
+        self.storedAt = storedAt
+    }
 
     enum CodingKeys: String, CodingKey {
         case distinctId = "distinct_id"
         case flags
+        case storedAt = "stored_at"
     }
 }

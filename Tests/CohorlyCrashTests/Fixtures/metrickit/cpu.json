@@ -1,0 +1,30 @@
+{
+  "version": "1.0.0",
+  "callStackTree": {
+    "callStackPerThread": false,
+    "callStacks": [
+      {
+        "threadAttributed": true,
+        "callStackRootFrames": [
+          {
+            "binaryUUID": "74AAFB80-37D1-3F51-8F1A-165BE39E8122",
+            "offsetIntoBinaryTextSegment": 10404,
+            "sampleCount": 120,
+            "binaryName": "Shop",
+            "address": 4375939236
+          }
+        ]
+      }
+    ]
+  },
+  "diagnosticMetaData": {
+    "appBuildVersion": "26",
+    "appVersion": "1.3.9",
+    "deviceType": "iPhone16,2",
+    "osVersion": "iPhone OS 27.0 (24A335)",
+    "platformArchitecture": "arm64e",
+    "regionFormat": "BR",
+    "totalCPUTime": "90 sec",
+    "totalSampledTime": "180 sec"
+  }
+}

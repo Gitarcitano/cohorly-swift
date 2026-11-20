@@ -17,6 +17,8 @@ public final class Cohorly: @unchecked Sendable {
         /// Feature-flag cache (mirrors sdk-core's `chl_flags`), scoped by
         /// distinct id so one user's flags are never served to another.
         static let flags = "cohorly.flags"
+        /// "1" while the app opted out of tracking (sdk-core `cohorly_opt_out`).
+        static let optOut = "cohorly.opt_out"
     }
 
     /// Shared instance, set by `initialize(apiHost:)`. `nil` until then.
@@ -26,6 +28,61 @@ public final class Cohorly: @unchecked Sendable {
 
     /// Cohorly's hosted ingestion API, used when no `apiHost` is supplied.
     public static let defaultAPIHost = "https://cohorly-service.velloalabs.com"
+
+    /// Posted (object: the instance) after init, `identify()` and `reset()`
+    /// with the new identity in `userInfo` under `IdentityKey`. Delivered
+    /// synchronously on the SDK's queue: read the values from `userInfo`, never
+    /// call back into the instance from the observer. Used by `CohorlyCrash`
+    /// to keep crash-time identity current.
+    public static let identityDidChangeNotification = Notification.Name("CohorlyIdentityDidChange")
+
+    /// `userInfo` keys of `identityDidChangeNotification`. `userId` is present
+    /// only for an identified user.
+    public enum IdentityKey {
+        public static let distinctId = "distinct_id"
+        public static let deviceId = "device_id"
+        public static let userId = "user_id"
+    }
+
+    /// Posted (object: the instance) by `CohorlyReplay` every time a replay
+    /// session starts, the first one included, with the new id in `userInfo`
+    /// under `ReplaySessionKey.sessionId`. Delivered synchronously on the
+    /// posting thread: read the value, never call back into the instance.
+    /// `CohorlyCrash` follows it so a crash carries the `$session_id` of the
+    /// session it happened in.
+    public static let replaySessionDidChangeNotification = Notification.Name("CohorlyReplaySessionDidChange")
+
+    /// `userInfo` keys of `replaySessionDidChangeNotification`.
+    public enum ReplaySessionKey {
+        public static let sessionId = "session_id"
+    }
+
+    /// Posted (object: the instance) on the SDK queue when `reset()` runs,
+    /// before any later `track()` is built and before the identity
+    /// notification, with the new anonymous id under
+    /// `IdentityKey.distinctId`. `CohorlyReplay` rotates its session on it.
+    @_spi(CohorlyReplay)
+    public static let didResetNotification = Notification.Name("CohorlyDidReset")
+
+    /// Posted (object: the instance) on the SDK queue by `optOutTracking()`
+    /// and `optInTracking()`, with the new state under `optedOutKey` (Bool).
+    @_spi(CohorlyReplay)
+    public static let trackingOptOutDidChangeNotification = Notification.Name("CohorlyTrackingOptOutDidChange")
+
+    @_spi(CohorlyReplay)
+    public static let optedOutKey = "opted_out"
+
+    /// Default flag-cache TTL: 24 hours, the Mixpanel reference default for
+    /// flag persistence. Shared with the sibling SDKs so a cache means the
+    /// same thing everywhere.
+    public static let defaultFlagCacheTTL: TimeInterval = 24 * 60 * 60
+
+    /// Hard staleness bound for the persisted flag cache under
+    /// `persistenceUntilNetworkSuccess`: 7 days. That policy trades
+    /// freshness for offline availability, so a cache past `flagCacheTTL` is
+    /// still served while it is within this window - the served window is
+    /// the wider of the configured TTL and 7 days.
+    public static let flagCacheMaxStale: TimeInterval = 7 * 24 * 60 * 60
 
     /// Creates and stores the shared instance. Call once near app launch.
     @discardableResult
@@ -39,10 +96,13 @@ public final class Cohorly: @unchecked Sendable {
         maxQueueSize: Int = 1000,
         maxRetryDelay: TimeInterval = 600,
         trackAutomaticEvents: Bool = false,
+        trackScreenViews: Bool = false,
         clock: CohorlyClock = SystemClock(),
         flagsFetcher: CohorlyFlagsFetcher = URLSessionFlagsFetcher(),
         loadFeatureFlags: Bool = true,
-        sendExposureEvents: Bool = true
+        sendExposureEvents: Bool = true,
+        flagPersistence: FlagPersistenceMode = .persistenceUntilNetworkSuccess,
+        flagCacheTTL: TimeInterval = Cohorly.defaultFlagCacheTTL
     ) -> Cohorly {
         let instance = Cohorly(
             apiHost: apiHost,
@@ -54,10 +114,13 @@ public final class Cohorly: @unchecked Sendable {
             maxQueueSize: maxQueueSize,
             maxRetryDelay: maxRetryDelay,
             trackAutomaticEvents: trackAutomaticEvents,
+            trackScreenViews: trackScreenViews,
             clock: clock,
             flagsFetcher: flagsFetcher,
             loadFeatureFlags: loadFeatureFlags,
-            sendExposureEvents: sendExposureEvents
+            sendExposureEvents: sendExposureEvents,
+            flagPersistence: flagPersistence,
+            flagCacheTTL: flagCacheTTL
         )
         shared = instance
         return instance
@@ -77,10 +140,29 @@ public final class Cohorly: @unchecked Sendable {
     /// Upper bound on the retry backoff, in seconds.
     private let maxRetryDelay: TimeInterval
     private let queue = DispatchQueue(label: "com.cohorly.sdk")
+    /// Serial delivery point for `onFeatureFlags` callbacks: emissions are
+    /// enqueued from inside `queue` where the flag state is committed, so
+    /// delivery order always matches commit order (an identity-clear `[:]`
+    /// can never land after a reload that already repopulated the set).
+    private let flagNotifyQueue = DispatchQueue(label: "com.cohorly.sdk.flags")
     private var timer: DispatchSourceTimer?
 
-    /// Exponential backoff base, in seconds.
-    private let backoffBase: TimeInterval = 2
+    private let backoff: CohorlyBackoff
+
+    /// Persisted opt-out flag; see `optOutTracking()`.
+    private var optedOut = false
+    /// Bumped by `optOutTracking()`: a flush that started before it neither
+    /// re-queues its batch nor starts a backoff when it comes back.
+    private var optOutEpoch: UInt64 = 0
+
+    /// Replay hooks (`@_spi(CohorlyReplay)`). Behind their own lock, not
+    /// `queue`, so `CohorlyReplay` can install them from any thread and
+    /// `track()` reads them on `queue` without a nested `queue.sync`.
+    private let replayHooksLock = NSLock()
+    private var sessionIdProvider: (@Sendable (String) -> String?)?
+    private var trackedEventObservers: [UInt64: @Sendable (String, Properties) -> Void] = [:]
+    private var trackedEventObserverSeq: UInt64 = 0
+    private var replaySessionId: String?
 
     private var distinctId: String
     /// Stable per-device id stamped as `$device_id` on every event. Persisted
@@ -135,8 +217,27 @@ public final class Cohorly: @unchecked Sendable {
     /// In-memory only (never persisted) and cleared by `identify()`/`reset()`,
     /// so a new identity re-reports its exposures exactly once.
     private var reportedExposures: Set<String> = []
+    /// How flag reads resolve values against the persisted cache.
+    private let flagPersistence: FlagPersistenceMode
+    /// Max age of the persisted flag cache, in seconds (see
+    /// `defaultFlagCacheTTL`). How a cache older than this is treated depends
+    /// on `flagPersistence` (see `isFlagCacheUsable`): `networkFirst` is
+    /// strict, `persistenceUntilNetworkSuccess` still serves it inside
+    /// `flagCacheMaxStale`, and a legacy cache with no `stored_at` is served
+    /// indefinitely.
+    private let flagCacheTTL: TimeInterval
+    /// Where the currently served flag set came from (`nil` until flags load).
+    /// One source covers the whole map because the set is swapped atomically:
+    /// a cache load or a network success replaces it wholesale, never per key.
+    private var flagSource: FlagSource?
+    /// Epoch ms the served flag set was persisted; non-nil only while
+    /// `flagSource == .persistence`.
+    private var flagPersistedAt: Int?
     /// Drives `$ae_*` lifecycle events; non-nil only when `trackAutomaticEvents`.
     private var automaticEvents: AutomaticEvents?
+    /// Drives automatic `$screen` events; non-nil only when `trackScreenViews`.
+    /// Internal so tests can tell the option is off.
+    private(set) var screenViewTracker: ScreenViewTracker?
 
     /// Creates a standalone instance. Prefer `initialize(apiHost:)` for the
     /// shared singleton; this initializer is public mainly so tests (and
@@ -152,13 +253,18 @@ public final class Cohorly: @unchecked Sendable {
         maxQueueSize: Int = 1000,
         maxRetryDelay: TimeInterval = 600,
         trackAutomaticEvents: Bool = false,
+        trackScreenViews: Bool = false,
         clock: CohorlyClock = SystemClock(),
         flagsFetcher: CohorlyFlagsFetcher = URLSessionFlagsFetcher(),
         loadFeatureFlags: Bool = true,
-        sendExposureEvents: Bool = true
+        sendExposureEvents: Bool = true,
+        flagPersistence: FlagPersistenceMode = .persistenceUntilNetworkSuccess,
+        flagCacheTTL: TimeInterval = Cohorly.defaultFlagCacheTTL
     ) {
         self.flagsFetcher = flagsFetcher
         self.sendExposureEvents = sendExposureEvents
+        self.flagPersistence = flagPersistence
+        self.flagCacheTTL = flagCacheTTL
         self.apiHost = apiHost.hasSuffix("/") ? String(apiHost.dropLast()) : apiHost
         self.token = token
         self.transport = transport
@@ -167,6 +273,7 @@ public final class Cohorly: @unchecked Sendable {
         self.flushAt = flushAt
         self.maxQueueSize = maxQueueSize
         self.maxRetryDelay = maxRetryDelay
+        self.backoff = CohorlyBackoff(maxDelay: maxRetryDelay)
         self.effectiveBatchSize = flushAt
         self.clock = clock
 
@@ -212,18 +319,25 @@ public final class Cohorly: @unchecked Sendable {
             let decoded = try? JSONDecoder().decode([EngagePayload].self, from: data) {
             self.engageQueue = decoded
         }
+        self.optedOut = storage.string(forKey: Keys.optOut) == "1"
+        if optedOut {
+            // Whatever a previous launch left queued is never sent.
+            eventQueue = []
+            engageQueue = []
+            persistEventQueue()
+            persistEngageQueue()
+        }
 
-        // Feature-flag cache: served only when it belongs to the current
-        // distinct id; another identity's cache is dropped, never served.
-        if let raw = storage.string(forKey: Keys.flags),
-            let data = raw.data(using: .utf8),
-            let cache = try? JSONDecoder().decode(FlagsCache.self, from: data) {
-            if cache.distinctId == self.distinctId {
-                self.flags = cache.flags
-                self.flagsLoaded = true
-            } else {
-                storage.setString(nil, forKey: Keys.flags)
-            }
+        // Feature-flag cache, per `flagPersistence`: the persistent modes
+        // adopt a valid cache immediately (synchronous reads cannot await the
+        // network the way Mixpanel's async lookups do, so `networkFirst`
+        // serves identically to `persistenceUntilNetworkSuccess` - see the
+        // enum doc); `networkOnly` never reads nor writes the key on the
+        // serving path (identify()/reset() still remove it - that is identity
+        // hygiene, not flag serving). Safe to run before `queue` exists -
+        // the instance is not shared yet.
+        if flagPersistence != .networkOnly {
+            loadPersistedFlagsLocked()
         }
 
         startTimer()
@@ -240,6 +354,24 @@ public final class Cohorly: @unchecked Sendable {
             self.automaticEvents = newAutomaticEvents
             newAutomaticEvents.start(currentVersion: DeviceInfo.appVersion)
         }
+
+        if trackScreenViews {
+            let tracker = ScreenViewTracker(client: self)
+            self.screenViewTracker = tracker
+            ScreenViewSwizzle.register(tracker)
+        }
+
+        postIdentityChange()
+    }
+
+    /// Posts `identityDidChangeNotification`. Called from init or on `queue`.
+    private func postIdentityChange() {
+        var userInfo: [String: String] = [
+            IdentityKey.distinctId: distinctId,
+            IdentityKey.deviceId: deviceId
+        ]
+        if !anonymous { userInfo[IdentityKey.userId] = distinctId }
+        NotificationCenter.default.post(name: Cohorly.identityDidChangeNotification, object: self, userInfo: userInfo)
     }
 
     deinit {
@@ -296,6 +428,145 @@ public final class Cohorly: @unchecked Sendable {
         queue.sync { deviceId }
     }
 
+    /// The identified user's id (`$user_id`), nil while anonymous.
+    public var currentUserId: String? {
+        queue.sync { anonymous ? nil : distinctId }
+    }
+
+    /// The ingestion API base URL this instance sends to.
+    public var configuredAPIHost: String { apiHost }
+
+    /// The project token passed to init, if any.
+    public var configuredToken: String? { token }
+
+    // MARK: - Opt-out
+
+    /// Stops collecting for this device. Persisted (survives a relaunch);
+    /// drops every queued event and profile update, and until
+    /// `optInTracking()` no `track`, `people` or `/alias` call is queued or
+    /// sent and no flags are requested. `CohorlyReplay` stops too and deletes
+    /// its queued chunks.
+    public func optOutTracking() {
+        // The flag is written before returning so a relaunch right after
+        // never misses it; the queues are dropped in order with `track`.
+        storage.setString("1", forKey: Keys.optOut)
+        queue.async {
+            self.optedOut = true
+            self.optOutEpoch &+= 1
+            self.eventQueue = []
+            self.engageQueue = []
+            self.persistEventQueue()
+            self.persistEngageQueue()
+            self.postOptOutChange()
+        }
+    }
+
+    /// Resumes collecting after `optOutTracking()`. What was discarded is not
+    /// restored.
+    public func optInTracking() {
+        storage.setString(nil, forKey: Keys.optOut)
+        queue.async {
+            guard self.optedOut else { return }
+            self.optedOut = false
+            self.postOptOutChange()
+        }
+    }
+
+    /// Whether the app opted out (the persisted flag).
+    public func hasOptedOutTracking() -> Bool {
+        queue.sync { optedOut }
+    }
+
+    private func postOptOutChange() {
+        NotificationCenter.default.post(
+            name: Cohorly.trackingOptOutDidChangeNotification,
+            object: self,
+            userInfo: [Cohorly.optedOutKey: optedOut])
+    }
+
+    // MARK: - Replay hooks
+
+    /// `$lib_version` of this SDK.
+    @_spi(CohorlyReplay)
+    public static var sdkVersion: String { DeviceInfo.libVersion }
+
+    @_spi(CohorlyReplay)
+    public var configuredStorage: CohorlyStorage { storage }
+
+    @_spi(CohorlyReplay)
+    public var configuredClock: CohorlyClock { clock }
+
+    @_spi(CohorlyReplay)
+    public var configuredMaxRetryDelay: TimeInterval { maxRetryDelay }
+
+    /// Called on the SDK queue for every `track()` (event name in), after the
+    /// caller's properties, even when the caller set `$session_id`: its id is
+    /// stamped as `$session_id` unless the caller set one. It must not call back into the instance synchronously
+    /// nor `sync` onto a queue that may wait on this one. `nil` removes it.
+    @_spi(CohorlyReplay)
+    public func setSessionIdProvider(_ provider: (@Sendable (String) -> String?)?) {
+        replayHooksLock.lock()
+        sessionIdProvider = provider
+        replayHooksLock.unlock()
+    }
+
+    /// Called on the SDK queue with the name and final properties of every
+    /// event `track()` queues (`$exception` included), right after it is
+    /// queued. Same re-entrancy rule as `setSessionIdProvider`. Returns a
+    /// closure that removes it.
+    @_spi(CohorlyReplay)
+    @discardableResult
+    public func addTrackedEventObserver(
+        _ observer: @escaping @Sendable (String, Properties) -> Void
+    ) -> @Sendable () -> Void {
+        replayHooksLock.lock()
+        trackedEventObserverSeq &+= 1
+        let id = trackedEventObserverSeq
+        trackedEventObservers[id] = observer
+        replayHooksLock.unlock()
+        // Removal is ordered with `track` on the SDK queue: an event tracked
+        // before the call still reaches the observer.
+        return { [weak self] in
+            self?.queue.async {
+                guard let self else { return }
+                self.replayHooksLock.lock()
+                self.trackedEventObservers.removeValue(forKey: id)
+                self.replayHooksLock.unlock()
+            }
+        }
+    }
+
+    /// Records the live replay session and posts
+    /// `replaySessionDidChangeNotification` on the calling thread. `nil`
+    /// (replay uninstalled or replaced) clears it: the notification then has
+    /// no `ReplaySessionKey.sessionId`.
+    @_spi(CohorlyReplay)
+    public func publishReplaySession(_ sessionId: String?) {
+        replayHooksLock.lock()
+        replaySessionId = sessionId
+        replayHooksLock.unlock()
+        var userInfo: [String: String] = [:]
+        if let sessionId { userInfo[ReplaySessionKey.sessionId] = sessionId }
+        NotificationCenter.default.post(
+            name: Cohorly.replaySessionDidChangeNotification,
+            object: self,
+            userInfo: userInfo)
+    }
+
+    /// The last session `publishReplaySession` recorded, nil without replay.
+    @_spi(CohorlyReplay)
+    public var currentReplaySessionId: String? {
+        replayHooksLock.lock()
+        defer { replayHooksLock.unlock() }
+        return replaySessionId
+    }
+
+    private func replayHooks() -> ((@Sendable (String) -> String?)?, [@Sendable (String, Properties) -> Void]) {
+        replayHooksLock.lock()
+        defer { replayHooksLock.unlock() }
+        return (sessionIdProvider, Array(trackedEventObservers.values))
+    }
+
     public func register(_ properties: [String: Any]) {
         queue.async {
             for (key, value) in properties {
@@ -332,6 +603,10 @@ public final class Cohorly: @unchecked Sendable {
 
     public func track(_ event: String, properties: [String: Any]? = nil) {
         queue.async {
+            if self.optedOut {
+                self.timedEvents.removeValue(forKey: event)
+                return
+            }
             var merged = self.superProperties
             for (key, value) in DeviceInfo.autoProperties() {
                 merged[key] = value
@@ -361,10 +636,18 @@ public final class Cohorly: @unchecked Sendable {
             if !self.anonymous, merged["$user_id"] == nil {
                 merged["$user_id"] = .string(self.distinctId)
             }
+            let (provider, observers) = self.replayHooks()
+            // The provider is asked even when the caller set `$session_id`:
+            // the call is what counts the activity (and may rotate). The
+            // caller's value wins on the event.
+            if let sessionId = provider?(event), merged["$session_id"] == nil {
+                merged["$session_id"] = .string(sessionId)
+            }
 
             self.eventQueue.append(TrackEvent(event: event, properties: merged))
             _ = self.enforceEventQueueCap()
             self.persistEventQueue()
+            for observer in observers { observer(event, merged) }
 
             if self.eventQueue.count >= self.flushAt {
                 self.performFlush()
@@ -396,14 +679,36 @@ public final class Cohorly: @unchecked Sendable {
             self.anonymous = false
             self.storage.setString(distinctId, forKey: Keys.distinctId)
             self.storage.setString("0", forKey: Keys.anonymous)
+            self.postIdentityChange()
             // Exposures are per-identity: the new user must report its own.
             self.reportedExposures.removeAll()
 
-            // Flags are per-identity: refresh them for the new id, off the
-            // serial queue so the request never delays the switch.
+            // Flags are per-identity: drop the previous identity's values
+            // (memory and disk) BEFORE asking the server for this id's flags,
+            // so they can never be served to the new identity - including
+            // under `networkOnly`, where the in-memory set is all there is.
+            // The persisted entry is removed under every policy: identity
+            // hygiene, not flag serving. The seq bump also marks any
+            // in-flight reload as stale.
+            self.flags = [:]
+            self.flagsLoaded = false
+            self.flagSource = nil
+            self.flagPersistedAt = nil
+            self.flagRequestSeq &+= 1
+            self.storage.setString(nil, forKey: Keys.flags)
+            // The served set changed to empty: notify listeners via the
+            // serial delivery queue (a listener may re-read flags, which
+            // would deadlock a nested queue.sync). Enqueued here, still on
+            // `queue`, its delivery is ordered before any emission a later
+            // commit produces - a stale `[:]` can never land on top of flags
+            // a concurrent reload already adopted.
+            let flagListeners = Array(self.flagListeners.values)
+            self.flagNotifyQueue.async {
+                for listener in flagListeners { listener([:]) }
+            }
             Task { await self.reloadFeatureFlags() }
 
-            guard wasAnonymous else { return }
+            guard wasAnonymous, !self.optedOut else { return }
             self.sendAlias(AliasPayload(alias: previousId, distinctId: distinctId, token: self.token))
         }
     }
@@ -448,17 +753,34 @@ public final class Cohorly: @unchecked Sendable {
             self.storage.setString(self.distinctId, forKey: Keys.distinctId)
             self.storage.setString(self.deviceId, forKey: Keys.deviceId)
             self.storage.setString("1", forKey: Keys.anonymous)
+            NotificationCenter.default.post(
+                name: Cohorly.didResetNotification, object: self,
+                userInfo: [IdentityKey.distinctId: self.distinctId])
+            self.postIdentityChange()
             self.persistSuperProperties()
             self.persistEventQueue()
             self.persistEngageQueue()
             // Flags are per-identity: the previous identity's flags must never
             // be served to the fresh anonymous id, so drop them (memory and
-            // disk) BEFORE asking the server for this id's flags.
+            // disk, under every policy - identity hygiene) BEFORE asking the
+            // server for this id's flags.
             self.flags = [:]
             self.flagsLoaded = false
+            self.flagSource = nil
+            self.flagPersistedAt = nil
             self.flagRequestSeq &+= 1
             self.reportedExposures.removeAll()
             self.storage.setString(nil, forKey: Keys.flags)
+            // The served set changed to empty: notify listeners via the
+            // serial delivery queue (a listener may re-read flags, which
+            // would deadlock a nested queue.sync). Enqueued here, still on
+            // `queue`, its delivery is ordered before any emission a later
+            // commit produces - a stale `[:]` can never land on top of flags
+            // a concurrent reload already adopted.
+            let flagListeners = Array(self.flagListeners.values)
+            self.flagNotifyQueue.async {
+                for listener in flagListeners { listener([:]) }
+            }
             Task { await self.reloadFeatureFlags() }
         }
     }
@@ -469,31 +791,62 @@ public final class Cohorly: @unchecked Sendable {
     /// `POST /flags/evaluate`, caching the result in memory and in `storage`
     /// (scoped by distinct id).
     ///
-    /// Never throws and never clears the cache on failure: a network error,
-    /// a non-2xx response or an unparseable body simply leaves the previously
-    /// known flags in place. Results are discarded when the identity changed,
-    /// or a newer reload started, while the request was in flight.
+    /// Never throws and never clears the served flags on failure: a network
+    /// error, a non-2xx response or an unparseable body re-adopts the
+    /// persisted cache under the persistent `flagPersistence` modes (a
+    /// safety net - it was already adopted at init), and leaves whatever the
+    /// network previously served under `networkOnly`. Results are discarded
+    /// when the identity changed, or a newer reload started, while the
+    /// request was in flight.
     public func reloadFeatureFlags() async {
-        let (requestedId, seq) = queue.sync { () -> (String, UInt64) in
+        let request = queue.sync { () -> (String, UInt64)? in
+            // Opted out: no request at all (it would carry the distinct id).
+            // Whatever is cached stays served.
+            guard !optedOut else { return nil }
             flagRequestSeq &+= 1
             return (distinctId, flagRequestSeq)
         }
+        guard let request else { return }
+        let (requestedId, seq) = request
         guard
             let body = try? JSONEncoder().encode(
                 FlagsRequest(distinctId: requestedId, token: token)),
             let data = await flagsFetcher.fetchFlags(
                 apiHost: apiHost, path: "/flags/evaluate", body: body),
             let decoded = try? JSONDecoder().decode(FlagsResponse.self, from: data)
-        else { return }
+        else {
+            // Evaluation failed: re-adopt the persisted cache under the
+            // persistent policies. Both persistent modes already adopted it
+            // at init, so this is normally an idempotent safety net (it also
+            // covers a cache written between init and now by another path).
+            // Once a network response has landed this session
+            // (`flagSource == .network`) its values are fresher than any cache
+            // the last success wrote, so they win and the cache is not
+            // re-read. `networkOnly` never touches it. Silent, like the
+            // sibling SDKs: a failed reload notifies nobody.
+            queue.sync {
+                guard flagPersistence != .networkOnly, flagSource != .network else { return }
+                loadPersistedFlagsLocked()
+            }
+            return
+        }
 
-        let listeners: [@Sendable ([String: FlagResult]) -> Void] = queue.sync {
-            guard requestedId == distinctId, seq == flagRequestSeq else { return [] }
+        queue.sync {
+            guard requestedId == distinctId, seq == flagRequestSeq else { return }
             flags = decoded.flags
             flagsLoaded = true
-            persistFlags()
-            return Array(flagListeners.values)
+            flagSource = .network
+            flagPersistedAt = nil
+            if flagPersistence != .networkOnly { persistFlags() }
+            // Delivered on the serial notify queue, enqueued here while the
+            // state is being committed, so listeners observe emissions in
+            // commit order.
+            let listeners = Array(flagListeners.values)
+            let adopted = decoded.flags
+            flagNotifyQueue.async {
+                for listener in listeners { listener(adopted) }
+            }
         }
-        for listener in listeners { listener(decoded.flags) }
     }
 
     /// The flag's variant when it has one, else its enabled boolean. `.bool(false)`
@@ -502,49 +855,158 @@ public final class Cohorly: @unchecked Sendable {
     /// Reading a *known* flag also emits `$feature_flag_called` once per
     /// distinct value, per identity (see `recordExposure`).
     public func getFeatureFlag(_ key: String) -> JSONValue {
-        let (value, exposure) = queue.sync { () -> (JSONValue, Any?) in
-            guard let flag = flags[key] else { return (.bool(false), nil) }
-            let value: JSONValue = flag.variant.map { JSONValue.string($0) } ?? .bool(flag.enabled)
-            return (value, recordExposure(key: key, flag: flag))
-        }
-        trackExposure(key: key, response: exposure)
-        return value
+        getFeatureFlag(key, fallback: false)
+    }
+
+    /// The flag's value, or `fallback` when the flag is unknown or unloaded.
+    ///
+    /// A read that resolves to `fallback` is not an exposure: nothing was
+    /// assigned, so no `$feature_flag_called` is emitted (Mixpanel parity -
+    /// fallback variants never fire the exposure event).
+    public func getFeatureFlag(_ key: String, fallback: Bool) -> JSONValue {
+        getFeatureFlagDetails(key, fallback: fallback).value
+    }
+
+    /// The flag's value, or `fallback` when the flag is unknown or unloaded.
+    /// Same exposure terms as the `Bool` overload; the two overloads mirror
+    /// the shared contract's `boolean | string` fallback type.
+    public func getFeatureFlag(_ key: String, fallback: String) -> JSONValue {
+        getFeatureFlagDetails(key, fallback: fallback).value
     }
 
     /// Whether `key` is enabled. `false` for an unknown or unloaded flag.
     ///
     /// Emits `$feature_flag_called` on the same terms as `getFeatureFlag`.
     public func isFeatureEnabled(_ key: String) -> Bool {
-        let (enabled, exposure) = queue.sync { () -> (Bool, Any?) in
-            guard let flag = flags[key] else { return (false, nil) }
+        isFeatureEnabled(key, fallback: false)
+    }
+
+    /// Whether `key` is enabled, or `fallback` when the flag is unknown or
+    /// unloaded. A read that resolves to `fallback` emits no exposure.
+    public func isFeatureEnabled(_ key: String, fallback: Bool) -> Bool {
+        let (enabled, exposure) = queue.sync {
+            () -> (Bool, FlagExposure?) in
+            guard let flag = flags[key] else { return (fallback, nil) }
             return (flag.enabled, recordExposure(key: key, flag: flag))
         }
-        trackExposure(key: key, response: exposure)
+        trackExposure(key: key, exposure: exposure)
         return enabled
     }
 
-    /// Marks `key` as exposed and returns the `$feature_flag_response` value to
-    /// report, or `nil` when nothing should be tracked (exposure events off, or
-    /// this key/value pair was already reported for the current identity).
+    /// The full lookup result for `key`: the value plus `enabled`, `payload`
+    /// and where it came from (`FlagDetails.source` is `.network`,
+    /// `.persistence` or `.fallback`, with `persistedAt`/`ttlMs` populated for
+    /// persistence-served values). A fallback result reports `enabled` = the
+    /// fallback's truthiness and `payload` = `nil`.
+    ///
+    /// Emits `$feature_flag_called` on the same terms as `getFeatureFlag`:
+    /// only a read of a *known* flag counts, so a result sourced from
+    /// `fallback` never reports an exposure.
+    public func getFeatureFlagDetails(_ key: String, fallback: Bool = false) -> FlagDetails {
+        getFeatureFlagDetails(key, jsonFallback: .bool(fallback))
+    }
+
+    /// The full lookup result with a `String` fallback: same contract as the
+    /// `Bool` overload (the two mirror the shared SDKs' `boolean | string`
+    /// fallback type).
+    public func getFeatureFlagDetails(_ key: String, fallback: String) -> FlagDetails {
+        getFeatureFlagDetails(key, jsonFallback: .string(fallback))
+    }
+
+    /// Shared implementation for the `getFeatureFlagDetails` overloads. A
+    /// fallback result carries `enabled` = the fallback's truthiness
+    /// (`true`, or a non-empty string) and a `nil` payload, mirroring the
+    /// sibling SDKs' `Boolean(fallback)` / `payload: null`.
+    private func getFeatureFlagDetails(_ key: String, jsonFallback: JSONValue) -> FlagDetails {
+        let (details, exposure) = queue.sync {
+            () -> (FlagDetails, FlagExposure?) in
+            guard let flag = flags[key] else {
+                return (
+                    FlagDetails(
+                        key: key,
+                        value: jsonFallback,
+                        enabled: jsonFallback.truthy,
+                        payload: nil,
+                        source: .fallback),
+                    nil
+                )
+            }
+            let value: JSONValue = flag.variant.map { JSONValue.string($0) } ?? .bool(flag.enabled)
+            let persisted = flagSource == .persistence
+            let details = FlagDetails(
+                key: key,
+                value: value,
+                enabled: flag.enabled,
+                payload: flag.payload,
+                source: flagSource ?? .network,
+                persistedAt: persisted ? flagPersistedAt : nil,
+                ttlMs: persisted ? Int(flagCacheTTL * 1000) : nil)
+            return (details, recordExposure(key: key, flag: flag))
+        }
+        trackExposure(key: key, exposure: exposure)
+        return details
+    }
+
+    /// The decision `recordExposure` hands to `trackExposure`: the response
+    /// value plus where it came from (`persistedAt`/`ttlMs` set only for
+    /// persistence-served values). A named type because SwiftLint caps
+    /// tuples at two members.
+    private struct FlagExposure {
+        let response: Any
+        let source: FlagSource
+        let persistedAt: Int?
+        let ttlMs: Int?
+    }
+
+    /// Marks `key` as exposed and returns the `$feature_flag_response` value
+    /// plus the source to report, or `nil` when nothing should be tracked
+    /// (exposure events off, or this key/value pair was already reported for
+    /// the current identity). Dedupe keys on (key, value) only, so the same
+    /// value served first from persistence and then from the network is
+    /// reported exactly once.
     ///
     /// Must be called on `queue`.
-    private func recordExposure(key: String, flag: FlagResult) -> Any? {
+    private func recordExposure(key: String, flag: FlagResult) -> FlagExposure? {
         guard sendExposureEvents else { return nil }
         let response: Any = flag.variant ?? flag.enabled
         let dedupeKey = "\(key):\(flag.variant ?? String(flag.enabled))"
         guard reportedExposures.insert(dedupeKey).inserted else { return nil }
-        return response
+        let persisted = flagSource == .persistence
+        return FlagExposure(
+            response: response,
+            source: flagSource ?? .network,
+            persistedAt: persisted ? flagPersistedAt : nil,
+            ttlMs: persisted ? Int(flagCacheTTL * 1000) : nil
+        )
     }
 
     /// Queues the exposure event. Called OFF `queue` (right after the
     /// `queue.sync` that decided it) because `track` hops onto `queue` itself -
     /// nesting the two would be a re-entrant `sync` and deadlock.
-    private func trackExposure(key: String, response: Any?) {
-        guard let response else { return }
-        track(
-            "$feature_flag_called",
-            properties: ["$feature_flag": key, "$feature_flag_response": response]
-        )
+    ///
+    /// `$feature_flag_source` is always stamped (`"network"` or
+    /// `"persistence"`), matching Mixpanel's always-present `$variant_source`,
+    /// so dashboards never have to guess whether a missing property means
+    /// "network" or "old SDK". Persistence reads also carry
+    /// `$feature_flag_persisted_at` (epoch ms) and `$feature_flag_ttl_ms`,
+    /// matching the sibling SDKs' exposure payloads.
+    private func trackExposure(
+        key: String,
+        exposure: FlagExposure?
+    ) {
+        guard let exposure else { return }
+        var properties: [String: Any] = [
+            "$feature_flag": key,
+            "$feature_flag_response": exposure.response,
+            "$feature_flag_source": exposure.source.rawValue
+        ]
+        if let persistedAt = exposure.persistedAt {
+            properties["$feature_flag_persisted_at"] = persistedAt
+        }
+        if let ttlMs = exposure.ttlMs {
+            properties["$feature_flag_ttl_ms"] = ttlMs
+        }
+        track("$feature_flag_called", properties: properties)
     }
 
     /// The JSON payload attached to `key`, or `nil` when it has none.
@@ -557,9 +1019,22 @@ public final class Cohorly: @unchecked Sendable {
         queue.sync { flags }
     }
 
-    /// Subscribes to flag updates. `listener` fires after every successful
-    /// reload, and immediately when flags are already loaded. Returns a closure
-    /// that removes the subscription.
+    /// Whether a flag set is currently being served (a successful network
+    /// evaluation or an adopted persisted cache). Goes back to false on
+    /// `identify()`/`reset()` until the new identity's flags land -
+    /// subscribers use it to keep serving "unloaded" instead of getter
+    /// fallbacks while the next set is still loading.
+    public func areFeatureFlagsLoaded() -> Bool {
+        queue.sync { flagsLoaded }
+    }
+
+    /// Subscribes to flag updates. `listener` fires whenever the served set
+    /// changes: after every successful reload, when `identify()`/`reset()`
+    /// drop the previous identity's flags (with an empty map), and
+    /// immediately at subscription when flags are already loaded - including
+    /// a set adopted from the persisted cache at startup. A failed reload
+    /// notifies nobody (the persisted cache is re-adopted silently, matching
+    /// the sibling SDKs). Returns a closure that removes the subscription.
     @discardableResult
     public func onFeatureFlags(
         _ listener: @escaping @Sendable ([String: FlagResult]) -> Void
@@ -576,14 +1051,85 @@ public final class Cohorly: @unchecked Sendable {
         }
     }
 
-    /// Must be called on `queue`.
+    /// Must be called on `queue`. Never called under `networkOnly`.
     private func persistFlags() {
         guard
             let data = try? JSONEncoder().encode(
-                FlagsCache(distinctId: distinctId, flags: flags)),
+                FlagsCache(
+                    distinctId: distinctId,
+                    flags: flags,
+                    storedAt: Int(clock.now().timeIntervalSince1970 * 1000))),
             let raw = String(data: data, encoding: .utf8)
         else { return }
         storage.setString(raw, forKey: Keys.flags)
+    }
+
+    /// Reads the persisted flag cache and installs it as the served set when
+    /// it belongs to the current distinct id AND is usable under
+    /// `flagPersistence` (see `isFlagCacheUsable`). Returns true when the
+    /// cache was served.
+    ///
+    /// A foreign-identity, too-stale or unparseable entry is dropped from
+    /// storage, never served. A legacy cache with no `stored_at` (written
+    /// before the TTL existed) cannot be dated, so it is served indefinitely
+    /// - the graceful-upgrade path preserving the pre-TTL behavior - until
+    /// the next successful reload replaces it with the stamped format.
+    /// Identity switches adopt nothing: the single-slot entry is removed by
+    /// `identify()`/`reset()`, so it can only ever hold the outgoing
+    /// identity's cache. Must be called on `queue` - or during `init`,
+    /// before the instance is shared.
+    @discardableResult
+    private func loadPersistedFlagsLocked() -> Bool {
+        guard
+            let raw = storage.string(forKey: Keys.flags),
+            let data = raw.data(using: .utf8),
+            let cache = try? JSONDecoder().decode(FlagsCache.self, from: data),
+            cache.distinctId == distinctId,
+            isFlagCacheUsable(cache)
+        else {
+            storage.setString(nil, forKey: Keys.flags)
+            return false
+        }
+        flags = cache.flags
+        flagsLoaded = true
+        flagSource = .persistence
+        // nil for a legacy cache without `stored_at` (unprovable age):
+        // persistedAt stays absent on FlagDetails and the exposure, while
+        // ttlMs is still reported.
+        flagPersistedAt = cache.storedAt
+        // A future `stored_at` (clock moved backwards after the write)
+        // would stay fresh on every adoption until real time catches up,
+        // outliving the TTL bound. Normalize the stamp to now and rewrite
+        // the entry so subsequent launches age it honestly.
+        let nowMs = Int(clock.now().timeIntervalSince1970 * 1000)
+        if let storedAt = cache.storedAt, storedAt > nowMs {
+            flagPersistedAt = nowMs
+            persistFlags()
+        }
+        return true
+    }
+
+    /// Whether a persisted cache may be served under `flagPersistence`.
+    /// `networkFirst` is strict: only while `stored_at` is within
+    /// `flagCacheTTL`. `persistenceUntilNetworkSuccess` trades freshness for
+    /// offline availability and serves until the wider of `flagCacheTTL` and
+    /// `flagCacheMaxStale` (inside the TTL always serves; expired still
+    /// serves up to 7 days stale). A legacy cache without `stored_at` has no
+    /// provable age: it is served indefinitely, matching the pre-TTL
+    /// behavior it was written under.
+    private func isFlagCacheUsable(_ cache: FlagsCache) -> Bool {
+        guard let storedAtMs = cache.storedAt else { return true }
+        // A future `stored_at` (clock moved backwards after the write)
+        // yields a negative age that would bypass every bound below; clamp
+        // it to fresh. The stamp itself is normalized to now on adoption
+        // so later launches age it honestly instead of staying fresh until
+        // the clock catches up.
+        let ageMs = max(0, Int(clock.now().timeIntervalSince1970 * 1000) - storedAtMs)
+        if flagPersistence == .networkFirst {
+            return ageMs <= Int(flagCacheTTL * 1000)
+        }
+        return ageMs <= max(
+            Int(flagCacheTTL * 1000), Int(Cohorly.flagCacheMaxStale * 1000))
     }
 
     public struct People {
@@ -636,6 +1182,7 @@ public final class Cohorly: @unchecked Sendable {
 
     private func queueEngage(_ makePayload: @escaping (String) -> EngagePayload) {
         queue.async {
+            guard !self.optedOut else { return }
             var payload = makePayload(self.distinctId)
             payload.token = self.token
             self.engageQueue.append(payload)
@@ -681,6 +1228,10 @@ public final class Cohorly: @unchecked Sendable {
             }
             return
         }
+        if optedOut {
+            completion?()
+            return
+        }
         if !force, let until = backoffUntil, Date() < until {
             completion?()
             return
@@ -704,12 +1255,15 @@ public final class Cohorly: @unchecked Sendable {
         let transport = self.transport
         // Epoch this batch was taken from; `reset()` bumps it (see below).
         let generation = flushGeneration
+        let epoch = optOutEpoch
 
         Task {
             var eventError: Error?
             var failedEngagements: [EngagePayload] = []
 
-            if !events.isEmpty {
+            // An opt-out between taking the batch and this task starting
+            // drops the batch: nothing is sent once optOutTracking() has run.
+            if !events.isEmpty, await self.isOptOutEpochCurrent(epoch) {
                 do {
                     let body = try JSONEncoder().encode(events)
                     try await transport.post(apiHost: apiHost, path: "/track", body: body)
@@ -717,7 +1271,9 @@ public final class Cohorly: @unchecked Sendable {
                     eventError = error
                 }
             }
-            if !engagements.isEmpty {
+            // An opt-out while /track was on the wire stops the rest of this
+            // flush: nothing is sent once optOutTracking() has run.
+            if !engagements.isEmpty, await self.isOptOutEpochCurrent(epoch) {
                 do {
                     let body = try JSONEncoder().encode(engagements)
                     try await transport.post(apiHost: apiHost, path: "/engage", body: body)
@@ -727,14 +1283,17 @@ public final class Cohorly: @unchecked Sendable {
             }
 
             self.queue.async {
-                if !events.isEmpty {
+                // An opt-out while the request was on the wire: its batches are
+                // gone for good and the failure says nothing about the next send.
+                let optedOutMeanwhile = epoch != self.optOutEpoch
+                if !events.isEmpty, !optedOutMeanwhile {
                     self.handleEventFlushResult(
                         events: events, error: eventError, generation: generation)
                 }
                 // Same rule as the event batch: a reset() during the request
                 // means these profile updates belong to a forgotten user, so
                 // drop them rather than re-queue and re-persist them.
-                if !failedEngagements.isEmpty, generation == self.flushGeneration {
+                if !failedEngagements.isEmpty, !optedOutMeanwhile, generation == self.flushGeneration {
                     self.engageQueue = failedEngagements + self.engageQueue
                     self.persistEngageQueue()
                 }
@@ -744,6 +1303,13 @@ public final class Cohorly: @unchecked Sendable {
                 self.pendingFlushCompletions = []
                 waiters.forEach { $0() }
             }
+        }
+    }
+
+    /// True while no opt-out ran since `epoch` was read (checked on `queue`).
+    private func isOptOutEpochCurrent(_ epoch: UInt64) async -> Bool {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            queue.async { continuation.resume(returning: epoch == self.optOutEpoch && !self.optedOut) }
         }
     }
 
@@ -796,22 +1362,10 @@ public final class Cohorly: @unchecked Sendable {
         }
 
         consecutiveFailures += 1
-        var delay = computeBackoff()
-        if status == 401 {
-            delay = maxRetryDelay
-        } else if status == 429, let retryAfter {
-            delay = min(retryAfter, maxRetryDelay)
-        }
+        let delay = status == 401
+            ? maxRetryDelay
+            : backoff.delay(failures: consecutiveFailures, retryAfter: status == 429 ? retryAfter : nil)
         backoffUntil = Date().addingTimeInterval(delay)
-    }
-
-    /// Exponential backoff: base 2s, doubling per consecutive failure, capped at
-    /// `maxRetryDelay`, with +/-20% jitter.
-    private func computeBackoff() -> TimeInterval {
-        let exp = backoffBase * pow(2, Double(consecutiveFailures - 1))
-        let capped = min(exp, maxRetryDelay)
-        let jitter = capped * 0.2 * (Double.random(in: -1...1))
-        return max(0, capped + jitter)
     }
 
     /// Trims the event queue to `maxQueueSize`, dropping the OLDEST events.

@@ -1,0 +1,67 @@
+{
+  "version": "1.0.0",
+  "callStackTree": {
+    "callStackPerThread": true,
+    "callStacks": [
+      {
+        "threadAttributed": false,
+        "callStackRootFrames": [
+          {
+            "binaryUUID": "ADD7CD1A-3C1D-3F42-AE0B-2B5C1F49E0AB",
+            "offsetIntoBinaryTextSegment": 4568,
+            "sampleCount": 1,
+            "binaryName": "libsystem_kernel.dylib",
+            "address": 7514435544
+          }
+        ]
+      },
+      {
+        "threadAttributed": true,
+        "callStackRootFrames": [
+          {
+            "binaryUUID": "74AAFB80-37D1-3F51-8F1A-165BE39E8122",
+            "offsetIntoBinaryTextSegment": 7308,
+            "sampleCount": 1,
+            "binaryName": "Shop",
+            "address": 4375936140,
+            "subFrames": [
+              {
+                "binaryUUID": "DFE6E5C0-5829-39C4-BB21-1AAD25F029B9",
+                "offsetIntoBinaryTextSegment": 26569992,
+                "sampleCount": 1,
+                "binaryName": "UIKitCore",
+                "address": 7576415496,
+                "subFrames": [
+                  {
+                    "binaryUUID": "D8104ED6-185E-3A2F-AD71-B91EDDBE2598",
+                    "offsetIntoBinaryTextSegment": 204156,
+                    "sampleCount": 1,
+                    "binaryName": "dyld",
+                    "address": 4380016508
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "diagnosticMetaData": {
+    "appBuildVersion": "27",
+    "appVersion": "1.4.0",
+    "bundleIdentifier": "com.example.shop",
+    "deviceType": "iPhone16,2",
+    "exceptionCode": 0,
+    "exceptionType": 1,
+    "isTestFlightApp": false,
+    "lowPowerModeEnabled": false,
+    "osVersion": "iPhone OS 27.1 (24B5070a)",
+    "pid": 812,
+    "platformArchitecture": "arm64e",
+    "regionFormat": "BR",
+    "signal": 11,
+    "terminationReason": "Namespace SIGNAL, Code 11 Segmentation fault: 11",
+    "virtualMemoryRegionInfo": "0 is not in any region."
+  }
+}

@@ -1,0 +1,79 @@
+Cohorly Swift SDK
+Licensed under the Apache License, Version 2.0: see LICENSE.
+
+Third-party code
+----------------
+
+posthog-ios (https://github.com/PostHog/posthog-ios)
+Copyright (c) 2023 PostHog. Licensed under the MIT License.
+
+GzipSwift (https://github.com/1024jp/GzipSwift)
+Copyright (c) 2014-2023 1024jp. Licensed under the MIT License.
+
+Sources/CohorlyReplay/Data+CohorlyGzip.swift is copied from posthog-ios
+(PostHog/Utils/Data+Gzip.swift), which takes it from GzipSwift, with its
+symbols renamed. Both are licensed under the MIT License:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+The session replay recorder (VEL-2138) copies or adapts these files of
+posthog-ios at commit a0a71796c2740a82c8a08059bff0f9d464720db0, with the
+PostHog prefix dropped and no dependency on the PostHog SDK; each file names
+its origin in its header. Licensed under the MIT License (text above):
+
+  Sources/CohorlyReplay/Recorder/ReplayWireframe.swift           PostHog/Replay/RRWireframe.swift, RRStyle.swift
+  Sources/CohorlyReplay/Recorder/ReplayCaptureScheduler.swift    PostHog/ApplicationRunLoopPublisher.swift,
+                                                                 PostHog/Utils/PostHogMulticastCallback.swift
+                                                                 (PostHogThrottledMulticastCallback)
+  Sources/CohorlyReplay/Recorder/ReplayCaptureBackoff.swift      PostHog/Replay/PostHogReplayCaptureBackoff.swift
+  Sources/CohorlyReplay/Recorder/ReplayWindowStatus.swift        PostHog/Replay/ViewTreeSnapshotStatus.swift
+  Sources/CohorlyReplay/Recorder/ReplayUtil.swift                PostHog/Replay/String+Util.swift, Float+Util.swift,
+                                                                 CGColor+Util.swift, Date+Util.swift
+  Sources/CohorlyReplay/Recorder/UIView+CohorlyReplay.swift      PostHog/Replay/UIView+Util.swift, UIColor+Util.swift,
+                                                                 CGColor+Util.swift, CGSize+Util.swift,
+                                                                 UITextInputTraits+Util.swift
+  Sources/CohorlyReplay/Recorder/ReplayRecorder.swift            PostHog/Replay/PostHogReplayIntegration.swift
+  Sources/CohorlyReplay/Recorder/WireframeBuilder.swift          PostHog/Replay/PostHogReplayIntegration.swift,
+                                                                 PostHog/Utils/UIApplication+.swift
+  Sources/CohorlyReplay/Recorder/ReplayMethodSwizzler.swift      PostHog/Replay/MethodSwizzler.swift
+
+Screenshot mode (VEL-2140) adds, from the same commit and under the same terms:
+
+  Sources/CohorlyReplay/Recorder/ScreenshotSnapshotSource.swift  PostHog/Replay/UIView+Util.swift (toImage),
+                                                                 PostHog/Replay/RRWireframe.swift (maskImage)
+  Sources/CohorlyReplay/Recorder/ReplayImageRenderer.swift       PostHog/Replay/PostHogGraphicsImageRenderer.swift
+  Sources/CohorlyReplay/Recorder/UIImage+CohorlyReplay.swift     PostHog/Replay/UIImage+Util.swift
+  Sources/CohorlyReplay/CohorlyNoCapture+SwiftUI.swift           PostHog/SwiftUI/PostHogMaskViewModifier.swift
+
+sentry-cocoa (https://github.com/getsentry/sentry-cocoa)
+Copyright (c) 2015 Sentry. Licensed under the MIT License (text above).
+
+PostHog/Replay/PostHogGraphicsImageRenderer.swift, from which
+Sources/CohorlyReplay/Recorder/ReplayImageRenderer.swift is adapted, states that
+portions of it are derived from getsentry/sentry-cocoa.
+
+dd-sdk-ios (https://github.com/DataDog/dd-sdk-ios)
+Copyright 2019-Present Datadog, Inc. Licensed under the Apache License, Version 2.0.
+
+PostHog/Replay/MethodSwizzler.swift, from which
+Sources/CohorlyReplay/Recorder/ReplayMethodSwizzler.swift is adapted, carries this
+notice: "Unless explicitly stated otherwise all files in this repository are
+licensed under the Apache License Version 2.0. This product includes software
+developed at Datadog (https://www.datadoghq.com/). Copyright 2019-Present
+Datadog, Inc."

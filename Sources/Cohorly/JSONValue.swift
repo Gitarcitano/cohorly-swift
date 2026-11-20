@@ -85,6 +85,18 @@ public enum JSONValue: Codable, Equatable, Sendable {
         }
     }
 
+    /// JavaScript-style truthiness, used for the `enabled` field of a
+    /// fallback `FlagDetails` (the sibling SDKs compute `Boolean(fallback)`):
+    /// `.bool` is itself, a `.string` is true when non-empty, everything else
+    /// is false.
+    var truthy: Bool {
+        switch self {
+        case .bool(let value): return value
+        case .string(let value): return !value.isEmpty
+        default: return false
+        }
+    }
+
     /// Converts back to a loosely-typed value suitable for `JSONSerialization`.
     public var anyValue: Any {
         switch self {

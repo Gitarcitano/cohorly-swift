@@ -1,0 +1,45 @@
+{
+  "version": "1.0.0",
+  "callStackTree": {
+    "callStackPerThread": false,
+    "callStacks": [
+      {
+        "threadAttributed": true,
+        "callStackRootFrames": [
+          {
+            "binaryUUID": "ADD7CD1A-3C1D-3F42-AE0B-2B5C1F49E0AB",
+            "offsetIntoBinaryTextSegment": 3020,
+            "sampleCount": 9,
+            "binaryName": "libsystem_kernel.dylib",
+            "address": 7514433996,
+            "subFrames": [
+              {
+                "binaryUUID": "74AAFB80-37D1-3F51-8F1A-165BE39E8122",
+                "offsetIntoBinaryTextSegment": 9120,
+                "sampleCount": 7,
+                "binaryName": "Shop",
+                "address": 4375937952
+              },
+              {
+                "binaryUUID": "6B8E0A17-E3F7-312A-BC74-06CAE030758A",
+                "offsetIntoBinaryTextSegment": 610368,
+                "sampleCount": 2,
+                "binaryName": "CoreFoundation",
+                "address": 7516626496
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "diagnosticMetaData": {
+    "appBuildVersion": "27",
+    "appVersion": "1.4.0",
+    "deviceType": "iPhone16,2",
+    "hangDuration": "4.25 sec",
+    "osVersion": "iPhone OS 27.1 (24B5070a)",
+    "platformArchitecture": "arm64e",
+    "regionFormat": "BR"
+  }
+}
