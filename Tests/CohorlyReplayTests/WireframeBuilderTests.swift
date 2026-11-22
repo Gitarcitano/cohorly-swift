@@ -189,6 +189,29 @@ final class WireframeBuilderTests: XCTestCase {
         XCTAssertEqual(wireframe?.text, "Terms of use")
     }
 
+    func testAReactNativeTextInputIsAMaskedInputEvenWhenNeverEditable() throws {
+        let input = add(FakeReactNativeTextView(), CGRect(x: 16, y: 100, width: 300, height: 80))
+        input.text = "read-only secret 7777"
+        input.isEditable = false
+        let subclassed = add(FakeReactNativeTextViewSubclass(), CGRect(x: 16, y: 300, width: 300, height: 80))
+        subclassed.text = "subclass secret 8888"
+        subclassed.isEditable = false
+        let terms = add(UITextView(), CGRect(x: 16, y: 200, width: 300, height: 80))
+        terms.text = "Terms of use"
+        terms.isEditable = false
+        let wireframes = build()
+        XCTAssertEqual(find(terms, in: wireframes)?.type, "text", "a plain read-only text view stays text")
+        XCTAssertEqual(find(terms, in: wireframes)?.text, "Terms of use")
+        let wireframe = try XCTUnwrap(find(input, in: wireframes))
+        XCTAssertEqual(wireframe.type, "input")
+        XCTAssertEqual(wireframe.inputType, "text_area")
+        XCTAssertEqual(wireframe.value, .string(String(repeating: "*", count: 21)))
+        XCTAssertNil(wireframe.text)
+        XCTAssertEqual(find(subclassed, in: wireframes)?.type, "input", "a subclass is a TextInput too")
+        XCTAssertFalse(try json(wireframes).contains("7777"))
+        XCTAssertFalse(try json(wireframes).contains("8888"))
+    }
+
     func testImagesHaveNoPixelsByDefaultAndAJPEGWhenAllowed() throws {
         let image = UIGraphicsImageRenderer(size: CGSize(width: 10, height: 10)).image { context in
             UIColor.blue.setFill()

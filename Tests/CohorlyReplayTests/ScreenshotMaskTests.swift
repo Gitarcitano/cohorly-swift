@@ -173,6 +173,26 @@ final class ScreenshotMaskTests: XCTestCase {
         XCTAssertTrue(white.red > 200 && white.green > 200 && white.blue > 200, "\(white)")
     }
 
+    func testAReactNativeTextInputIsPaintedOverAndAPlainReadOnlyTextViewIsNot() throws {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 320, height: 480))
+        let inputFrame = CGRect(x: 20, y: 20, width: 200, height: 80)
+        let termsFrame = CGRect(x: 20, y: 200, width: 200, height: 80)
+        let input = FakeReactNativeTextView(frame: inputFrame)
+        input.backgroundColor = .orange
+        input.text = "read-only secret"
+        input.isEditable = false
+        let terms = UITextView(frame: termsFrame)
+        terms.backgroundColor = .orange
+        terms.isEditable = false
+        for view in [input, terms] { window.addSubview(view) }
+        window.layoutIfNeeded()
+
+        let pixels = try readPixels(capture(window).1)
+        assertMasked(inputFrame, in: pixels, "React Native TextInput")
+        let center = pixel(pixels, Int(termsFrame.midX), Int(termsFrame.midY))
+        XCTAssertGreaterThan(center.red, 200, "a plain read-only text view keeps its pixels: \(center)")
+    }
+
     func testAMaskIsRoundedOutwardAndGrownByOnePixel() throws {
         let renderer = ReplayImageRenderer(size: CGSize(width: 32, height: 32), scale: 1)
         let image = renderer.image { context in

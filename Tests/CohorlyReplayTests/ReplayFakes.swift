@@ -1,4 +1,7 @@
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 import XCTest
 
 @_spi(CohorlyReplay) @testable import Cohorly
@@ -497,3 +500,12 @@ func eventIndexes(_ chunk: ReplayChunkBody?) -> [Int] {
         return index
     }
 }
+
+#if os(iOS)
+/// Stands in for React Native's `TextInput` text view: same Objective-C
+/// class name, which is all the recorder looks at.
+@objc(RCTUITextView) class FakeReactNativeTextView: UITextView {}
+
+/// A subclass of it, as an app or a library may declare.
+final class FakeReactNativeTextViewSubclass: FakeReactNativeTextView {}
+#endif
